@@ -14,6 +14,8 @@ import (
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/debug"
+	"github.com/steveyegge/beads/internal/gastown"
+	"github.com/steveyegge/beads/internal/hooks"
 	"github.com/steveyegge/beads/internal/remotecache"
 	"github.com/steveyegge/beads/internal/routing"
 	"github.com/steveyegge/beads/internal/storage"
@@ -689,6 +691,14 @@ var createCmd = &cobra.Command{
 			}
 		}
 
+		// Run create hook
+		if hookRunner != nil {
+			hookRunner.Run(hooks.EventCreate, issue)
+		}
+
+		// Emit gastown event (fire-and-forget)
+		gastown.EmitBeadCreated(gastown.FormatActor(actor), issue)
+
 		if jsonOutput {
 			outputJSON(issue)
 		} else if silent {
@@ -846,6 +856,198 @@ func init() {
 	createCmd.Flags().String("metadata", "", "Set custom metadata (JSON string or @file.json to read from file)")
 	// Note: --json flag is defined as a persistent flag in main.go, not here
 	rootCmd.AddCommand(createCmd)
+}
+
+func createInRig(cmd *cobra.Command, rigName, explicitID, title, description, issueType string, priority int, design, acceptance, notes, assignee string, labels []string, externalRef, specID string, wisp, noHistory bool) {
+	ctx := rootCtx
+
+	// Find the town-level beads directory (where routes.jsonl lives)
+	townBeadsDir, err := findTownBeadsDir()
+	if err != nil {
+		FatalError("cannot use --rig: %v", err)
+	}
+
+	// Resolve the target rig's beads directory and prefix
+	targetBeadsDir, targetPrefix, err := routing.ResolveBeadsDirForRig(rigName, townBeadsDir)
+	if err != nil {
+		FatalError("%v", err)
+	}
+
+	// Open storage for the target rig using factory to respect backend config
+	targetStore, err := newDoltStoreFromConfig(ctx, targetBeadsDir)
+	if err != nil {
+		FatalError("failed to open rig %q database: %v", rigName, err)
+	}
+	defer func() {
+		if err := targetStore.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to close rig database: %v\n", err)
+		}
+	}()
+
+	// Prepare prefix override from routes.jsonl for cross-rig creation
+	// Strip trailing hyphen - database stores prefix without it (e.g., "aops" not "aops-")
+	var prefixOverride string
+	if targetPrefix != "" {
+		prefixOverride = strings.TrimSuffix(targetPrefix, "-")
+	}
+
+	var externalRefPtr *string
+	if externalRef != "" {
+		externalRefPtr = &externalRef
+	}
+
+	// Extract event-specific flags (bd-xwvo fix)
+	eventCategory, _ := cmd.Flags().GetString("event-category")
+	eventActor, _ := cmd.Flags().GetString("event-actor")
+	eventTarget, _ := cmd.Flags().GetString("event-target")
+	eventPayload, _ := cmd.Flags().GetString("event-payload")
+
+	// Extract molecule/agent flags (bd-xwvo fix)
+	molTypeStr, _ := cmd.Flags().GetString("mol-type")
+	var molType types.MolType
+	if molTypeStr != "" {
+		molType = types.MolType(molTypeStr)
+	}
+	// Extract wisp type (TTL classification for ephemeral wisps)
+	wispTypeStr, _ := cmd.Flags().GetString("wisp-type")
+	var wispType types.WispType
+	if wispTypeStr != "" {
+		wispType = types.WispType(wispTypeStr)
+	}
+
+	// Extract time-based scheduling flags (bd-xwvo fix)
+	var dueAt *time.Time
+	dueStr, _ := cmd.Flags().GetString("due")
+	if dueStr != "" {
+		t, err := timeparsing.ParseRelativeTime(dueStr, time.Now())
+		if err != nil {
+			FatalError("invalid --due format %q", dueStr)
+		}
+		dueAt = &t
+	}
+
+	var deferUntil *time.Time
+	deferStr, _ := cmd.Flags().GetString("defer")
+	if deferStr != "" {
+		t, err := timeparsing.ParseRelativeTime(deferStr, time.Now())
+		if err != nil {
+			FatalError("invalid --defer format %q", deferStr)
+		}
+		deferUntil = &t
+	}
+
+	// Parse --metadata for cross-rig creation
+	var metadata json.RawMessage
+	if cmd.Flags().Changed("metadata") {
+		metadataValue, _ := cmd.Flags().GetString("metadata")
+		var metadataJSON string
+		if strings.HasPrefix(metadataValue, "@") {
+			filePath := metadataValue[1:]
+			// #nosec G304 -- user explicitly provides file path via @file.json syntax
+			data, err := os.ReadFile(filePath)
+			if err != nil {
+				FatalError("failed to read metadata file %s: %v", filePath, err)
+			}
+			metadataJSON = string(data)
+		} else {
+			metadataJSON = metadataValue
+		}
+		if !json.Valid([]byte(metadataJSON)) {
+			FatalError("invalid JSON in --metadata: must be valid JSON")
+		}
+		metadata = json.RawMessage(metadataJSON)
+	}
+
+	// Create issue with explicit ID if provided, otherwise CreateIssue will generate one
+	issue := &types.Issue{
+		ID:                 explicitID, // Set explicit ID if provided (empty string if not)
+		Title:              title,
+		Description:        description,
+		Design:             design,
+		AcceptanceCriteria: acceptance,
+		Notes:              notes,
+		SpecID:             specID,
+		Status:             types.StatusOpen,
+		Priority:           priority,
+		IssueType:          types.IssueType(issueType).Normalize(),
+		Assignee:           assignee,
+		ExternalRef:        externalRefPtr,
+		Ephemeral:          wisp,
+		NoHistory:          noHistory,
+		CreatedBy:          getActorWithGit(),
+		Owner:              getOwner(),
+		// Event fields (bd-xwvo fix)
+		EventKind: eventCategory,
+		Actor:     eventActor,
+		Target:    eventTarget,
+		Payload:   eventPayload,
+		// Molecule/agent fields (bd-xwvo fix)
+		MolType:  molType,
+		WispType: wispType,
+		// Time scheduling fields (bd-xwvo fix)
+		DueAt:      dueAt,
+		DeferUntil: deferUntil,
+		Metadata:   metadata,
+		// Cross-rig routing: use route prefix instead of database config
+		PrefixOverride: prefixOverride,
+	}
+
+	if err := targetStore.CreateIssue(ctx, issue, actor); err != nil {
+		FatalError("failed to create issue in rig %q: %v", rigName, err)
+	}
+
+	// Emit gastown event for cross-rig create (fire-and-forget)
+	gastown.EmitBeadCreated(gastown.FormatActor(actor), issue)
+
+	// Add labels if specified
+	for _, label := range labels {
+		if err := targetStore.AddLabel(ctx, issue.ID, label, actor); err != nil {
+			WarnError("failed to add label %s: %v", label, err)
+		}
+	}
+
+	// Get silent flag
+	silent, _ := cmd.Flags().GetBool("silent")
+
+	if jsonOutput {
+		outputJSON(issue)
+	} else if silent {
+		fmt.Println(issue.ID)
+	} else {
+		fmt.Printf("%s Created issue in rig %q: %s\n", ui.RenderPass("✓"), rigName, formatFeedbackID(issue.ID, issue.Title))
+		fmt.Printf("  Priority: P%d\n", issue.Priority)
+		fmt.Printf("  Status: %s\n", issue.Status)
+	}
+}
+
+// findTownBeadsDir finds the town-level .beads directory (where routes.jsonl lives).
+// It walks up from the current directory looking for a .beads directory with routes.jsonl.
+func findTownBeadsDir() (string, error) {
+	// Start from current directory and walk up
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+
+	for {
+		beadsDir := filepath.Join(dir, ".beads")
+		routesFile := filepath.Join(beadsDir, routing.RoutesFileName)
+
+		// Check if this .beads directory has routes.jsonl
+		if _, err := os.Stat(routesFile); err == nil {
+			return beadsDir, nil
+		}
+
+		// Move up one directory
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			// Reached filesystem root
+			break
+		}
+		dir = parent
+	}
+
+	return "", fmt.Errorf("no routes.jsonl found in any parent .beads directory")
 }
 
 // formatTimeForRPC converts a *time.Time to RFC3339 string for RPC calls.

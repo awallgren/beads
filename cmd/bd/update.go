@@ -10,6 +10,8 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/audit"
 	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/gastown"
+	"github.com/steveyegge/beads/internal/hooks"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/timeparsing"
 	"github.com/steveyegge/beads/internal/types"
@@ -470,8 +472,19 @@ create, update, show, or close operation).`,
 				}
 			}
 
-			// Re-fetch for display
-			updatedIssue, _ := issueStore.GetIssue(ctx, result.ResolvedID)
+			// Run update hook
+			updatedIssue, _ := issueStore.GetIssue(ctx, result.ResolvedID) // Best effort: nil issue handled by subsequent nil check
+			if updatedIssue != nil && hookRunner != nil {
+				hookRunner.Run(hooks.EventUpdate, updatedIssue)
+				// Also fire on_close hook when status actually transitions to closed (GH#2630)
+				if updatedIssue.Status == types.StatusClosed && issue.Status != types.StatusClosed {
+					hookRunner.Run(hooks.EventClose, updatedIssue)
+				}
+			}
+
+			// Emit gastown event (fire-and-forget)
+			gastown.EmitBeadUpdated(gastown.FormatActor(actor), updatedIssue)
+
 			updateTitle := ""
 			if updatedIssue != nil {
 				updateTitle = updatedIssue.Title

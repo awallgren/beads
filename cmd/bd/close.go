@@ -10,6 +10,8 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/audit"
 	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/gastown"
+	"github.com/steveyegge/beads/internal/hooks"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
@@ -173,6 +175,9 @@ create, update, show, or close operation).`,
 			// Re-fetch for display
 			closedIssue, _ := store.GetIssue(ctx, id)
 
+			// Emit gastown event (fire-and-forget)
+			gastown.EmitBeadClosed(gastown.FormatActor(actor), closedIssue)
+
 			if jsonOutput {
 				if closedIssue != nil {
 					closedIssues = append(closedIssues, closedIssue)
@@ -182,6 +187,77 @@ create, update, show, or close operation).`,
 			}
 		}
 
+		// Handle routed IDs (cross-rig)
+		for _, id := range routedArgs {
+			result, err := resolveAndGetIssueWithRouting(ctx, store, id)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error resolving %s: %v\n", id, err)
+				continue
+			}
+			if result == nil || result.Issue == nil {
+				if result != nil {
+					result.Close()
+				}
+				fmt.Fprintf(os.Stderr, "Issue %s not found\n", id)
+				continue
+			}
+
+			if err := validateIssueClosable(result.ResolvedID, result.Issue, force); err != nil {
+				result.Close()
+				fmt.Fprintf(os.Stderr, "%s\n", err)
+				continue
+			}
+
+			// Check gate satisfaction for machine-checkable gates (GH#1467)
+			if !force {
+				if err := checkGateSatisfaction(result.Issue); err != nil {
+					result.Close()
+					fmt.Fprintf(os.Stderr, "cannot close %s: %s\n", id, err)
+					continue
+				}
+			}
+
+			// Check if issue has open blockers (GH#962)
+			if !force {
+				blocked, blockers, err := result.Store.IsBlocked(ctx, result.ResolvedID)
+				if err != nil {
+					result.Close()
+					fmt.Fprintf(os.Stderr, "Error checking blockers for %s: %v\n", id, err)
+					continue
+				}
+				if blocked && len(blockers) > 0 {
+					result.Close()
+					fmt.Fprintf(os.Stderr, "cannot close %s: blocked by open issues %v (use --force to override)\n", id, blockers)
+					continue
+				}
+			}
+
+			if err := result.Store.CloseIssue(ctx, result.ResolvedID, reason, actor, session); err != nil {
+				result.Close()
+				fmt.Fprintf(os.Stderr, "Error closing %s: %v\n", id, err)
+				continue
+			}
+
+			closedCount++
+
+			// Auto-close parent molecule if all steps are now complete
+			autoCloseCompletedMolecule(ctx, result.Store, result.ResolvedID, actor, session)
+
+			// Get updated issue for hook (best effort: hook runs only if re-fetch succeeds)
+			closedIssue, _ := result.Store.GetIssue(ctx, result.ResolvedID)
+			if closedIssue != nil && hookRunner != nil {
+				hookRunner.Run(hooks.EventClose, closedIssue)
+			}
+
+			if jsonOutput {
+				if closedIssue != nil {
+					closedIssues = append(closedIssues, closedIssue)
+				}
+			} else {
+				fmt.Printf("%s Closed %s: %s\n", ui.RenderPass("✓"), formatFeedbackID(result.ResolvedID, result.Issue.Title), reason)
+			}
+			result.Close()
+		}
 		// Handle --suggest-next flag in direct mode
 		if suggestNext && len(resolvedIDs) == 1 && closedCount > 0 {
 			unblocked, err := store.GetNewlyUnblockedByClose(ctx, resolvedIDs[0])
